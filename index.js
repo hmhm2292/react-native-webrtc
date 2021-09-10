@@ -1,5 +1,6 @@
 'use strict';
 
+import ScreenCapturePickerView from './ScreenCapturePickerView';
 import RTCPeerConnection from './RTCPeerConnection';
 import RTCIceCandidate from './RTCIceCandidate';
 import RTCSessionDescription from './RTCSessionDescription';
@@ -13,6 +14,7 @@ import mediaDevices from './MediaDevices';
 import permissions from './Permissions';
 
 export {
+  ScreenCapturePickerView,
   RTCPeerConnection,
   RTCIceCandidate,
   RTCSessionDescription,
@@ -39,6 +41,9 @@ function registerGlobals() {
 
 	navigator.mediaDevices.getUserMedia =
 		mediaDevices.getUserMedia.bind(mediaDevices);
+
+	navigator.mediaDevices.getDisplayMedia =
+		mediaDevices.getDisplayMedia.bind(mediaDevices);
 
 	navigator.mediaDevices.enumerateDevices =
 		mediaDevices.enumerateDevices.bind(mediaDevices);

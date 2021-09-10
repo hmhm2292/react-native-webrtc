@@ -17,9 +17,9 @@
 #import <WebRTC/RTCIceServer.h>
 #import <WebRTC/RTCMediaConstraints.h>
 #import <WebRTC/RTCIceCandidate.h>
-#import <WebRTC/RTCLegacyStatsReport.h>
 #import <WebRTC/RTCSessionDescription.h>
 #import <WebRTC/RTCRtpTransceiver.h>
+#import <WebRTC/RTCStatisticsReport.h>
 
 #import "WebRTCModule.h"
 #import "WebRTCModule+RTCDataChannel.h"
@@ -28,12 +28,12 @@
 
 @implementation RTCPeerConnection (React)
 
-- (NSMutableDictionary<NSNumber *, RTCDataChannel *> *)dataChannels
+- (NSMutableDictionary<NSString *, DataChannelWrapper *> *)dataChannels
 {
   return objc_getAssociatedObject(self, _cmd);
 }
 
-- (void)setDataChannels:(NSMutableDictionary<NSNumber *, RTCDataChannel *> *)dataChannels
+- (void)setDataChannels:(NSMutableDictionary<NSString *, DataChannelWrapper *> *)dataChannels
 {
   objc_setAssociatedObject(self, @selector(dataChannels), dataChannels, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -82,26 +82,33 @@
 
 @implementation WebRTCModule (RTCPeerConnection)
 
-RCT_EXPORT_METHOD(peerConnectionInit:(RTCConfiguration*)configuration
-                            objectID:(nonnull NSNumber *)objectID)
+/*
+ * This method is synchronous and blocking. This is done so we can implement createDataChannel
+ * in the same way (synchronous) since the peer connection needs to exist before.
+ */
+RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(peerConnectionInit:(RTCConfiguration*)configuration
+                                                 objectID:(nonnull NSNumber *)objectID)
 {
-  NSDictionary *optionalConstraints = @{ @"DtlsSrtpKeyAgreement" : @"true" };
-  RTCMediaConstraints* constraints =
-      [[RTCMediaConstraints alloc] initWithMandatoryConstraints:nil
-                                            optionalConstraints:optionalConstraints];
-  RTCPeerConnection *peerConnection
-    = [self.peerConnectionFactory
-      peerConnectionWithConfiguration:configuration
-			  constraints:constraints
-                             delegate:self];
+    dispatch_sync(self.workerQueue, ^{
+        NSDictionary *optionalConstraints = @{ @"DtlsSrtpKeyAgreement" : @"true" };
+        RTCMediaConstraints* constraints =
+            [[RTCMediaConstraints alloc] initWithMandatoryConstraints:nil
+                                                  optionalConstraints:optionalConstraints];
+          RTCPeerConnection *peerConnection
+            = [self.peerConnectionFactory peerConnectionWithConfiguration:configuration
+                                                              constraints:constraints
+                                                                 delegate:self];
+          peerConnection.dataChannels = [NSMutableDictionary new];
+          peerConnection.reactTag = objectID;
+          peerConnection.remoteStreams = [NSMutableDictionary new];
+          peerConnection.remoteTracks = [NSMutableDictionary new];
+          peerConnection.videoTrackAdapters = [NSMutableDictionary new];
+          peerConnection.webRTCModule = self;
 
-  peerConnection.dataChannels = [NSMutableDictionary new];
-  peerConnection.reactTag = objectID;
-  peerConnection.remoteStreams = [NSMutableDictionary new];
-  peerConnection.remoteTracks = [NSMutableDictionary new];
-  peerConnection.videoTrackAdapters = [NSMutableDictionary new];
-  peerConnection.webRTCModule = self;
-  self.peerConnections[objectID] = peerConnection;
+          self.peerConnections[objectID] = peerConnection;
+    });
+
+    return nil;
 }
 
 RCT_EXPORT_METHOD(peerConnectionSetConfiguration:(RTCConfiguration*)configuration objectID:(nonnull NSNumber *)objectID)
@@ -285,11 +292,11 @@ RCT_EXPORT_METHOD(peerConnectionCreateOffer:(nonnull NSNumber *)objectID
       }];
 }
 
-RCT_EXPORT_METHOD(peerConnectionCreateAnswer:(nonnull NSNumber *)objectID
+RCT_EXPORT_METHOD(peerConnectionCreateAnswer:(nonnull NSNumber *)peerConnectionId
                                      options:(NSDictionary *)options
                                     callback:(RCTResponseSenderBlock)callback)
 {
-  RTCPeerConnection *peerConnection = self.peerConnections[objectID];
+  RTCPeerConnection *peerConnection = self.peerConnections[peerConnectionId];
   if (!peerConnection) {
     return;
   }
@@ -321,10 +328,14 @@ RCT_EXPORT_METHOD(peerConnectionCreateAnswer:(nonnull NSNumber *)objectID
        }];
 }
 
-RCT_EXPORT_METHOD(peerConnectionSetLocalDescription:(RTCSessionDescription *)sdp objectID:(nonnull NSNumber *)objectID callback:(RCTResponseSenderBlock)callback)
+RCT_EXPORT_METHOD(peerConnectionSetLocalDescription:(nonnull NSNumber *)objectID
+                                               desc:(RTCSessionDescription *)desc
+                                           resolver:(RCTPromiseResolveBlock)resolve
+                                           rejecter:(RCTPromiseRejectBlock)reject)
 {
   RTCPeerConnection *peerConnection = self.peerConnections[objectID];
   if (!peerConnection) {
+    reject(@"E_INVALID", @"PeerConnection not found", nil);
     return;
   }
 
@@ -347,7 +358,7 @@ RCT_EXPORT_METHOD(peerConnectionSetLocalDescription:(RTCSessionDescription *)sdp
 
 RCT_EXPORT_METHOD(peerConnectionSetRemoteDescription:(RTCSessionDescription *)sdp objectID:(nonnull NSNumber *)objectID callback:(RCTResponseSenderBlock)callback)
 {
-  RTCPeerConnection *peerConnection = self.peerConnections[objectID];
+  RTCPeerConnection __weak *peerConnection = self.peerConnections[objectID];
   if (!peerConnection) {
     return;
   }
@@ -369,16 +380,31 @@ RCT_EXPORT_METHOD(peerConnectionSetRemoteDescription:(RTCSessionDescription *)sd
   }];
 }
 
-RCT_EXPORT_METHOD(peerConnectionAddICECandidate:(RTCIceCandidate*)candidate objectID:(nonnull NSNumber *)objectID callback:(RCTResponseSenderBlock)callback)
+RCT_EXPORT_METHOD(peerConnectionAddICECandidate:(nonnull NSNumber *)objectID
+                                      candidate:(RTCIceCandidate*)candidate
+                                       resolver:(RCTPromiseResolveBlock)resolve
+                                       rejecter:(RCTPromiseRejectBlock)reject)
 {
   RTCPeerConnection *peerConnection = self.peerConnections[objectID];
   if (!peerConnection) {
+    reject(@"E_INVALID", @"PeerConnection not found", nil);
     return;
   }
 
-  [peerConnection addIceCandidate:candidate];
-  RCTLogTrace(@"addICECandidateresult: %@", candidate);
-  callback(@[@true]);
+  __weak RTCPeerConnection *weakPc = peerConnection;
+  [peerConnection addIceCandidate:candidate
+                completionHandler:^(NSError *error) {
+                  if (error) {
+                      reject(@"E_OPERATION_ERROR", @"addIceCandidate failed", error);
+                  } else {
+                      RTCPeerConnection *strongPc = weakPc;
+                      id newSdp = @{
+                          @"type": [RTCSessionDescription stringForType:strongPc.remoteDescription.type],
+                          @"sdp": strongPc.remoteDescription.sdp
+                      };
+                      resolve(newSdp);
+                  }
+                }];
 }
 
 RCT_EXPORT_METHOD(peerConnectionClose:(nonnull NSNumber *)objectID)
@@ -396,109 +422,139 @@ RCT_EXPORT_METHOD(peerConnectionClose:(nonnull NSNumber *)objectID)
   }
 
   [peerConnection close];
-  [self.peerConnections removeObjectForKey:objectID];
 
   // Clean up peerConnection's streams and tracks
   [peerConnection.remoteStreams removeAllObjects];
   [peerConnection.remoteTracks removeAllObjects];
 
   // Clean up peerConnection's dataChannels.
-  NSMutableDictionary<NSNumber *, RTCDataChannel *> *dataChannels
-    = peerConnection.dataChannels;
-  for (NSNumber *dataChannelId in dataChannels) {
-    dataChannels[dataChannelId].delegate = nil;
+  NSMutableDictionary<NSString *, DataChannelWrapper *> *dataChannels = peerConnection.dataChannels;
+  for (NSString *tag in dataChannels) {
+    dataChannels[tag].delegate = nil;
     // There is no need to close the RTCDataChannel because it is owned by the
     // RTCPeerConnection and the latter will close the former.
   }
   [dataChannels removeAllObjects];
+
+  [self.peerConnections removeObjectForKey:objectID];
 }
 
-RCT_EXPORT_METHOD(peerConnectionGetStats:(nonnull NSString *)trackID
-                                objectID:(nonnull NSNumber *)objectID
-                                callback:(RCTResponseSenderBlock)callback)
+RCT_EXPORT_METHOD(peerConnectionGetStats:(nonnull NSNumber *) objectID
+                                resolver:(RCTPromiseResolveBlock)resolve
+                                rejecter:(RCTPromiseRejectBlock)reject)
 {
   RTCPeerConnection *peerConnection = self.peerConnections[objectID];
   if (!peerConnection) {
-    callback(@[@(NO), @"PeerConnection ID not found"]);
+    reject(@"invalid_id", @"PeerConnection ID not found", nil);
     return;
   }
 
-  RTCMediaStreamTrack *track = nil;
-  if (!trackID
-      || !trackID.length
-      || (track = self.localTracks[trackID])
-      || (track = peerConnection.remoteTracks[trackID])) {
-    [peerConnection statsForTrack:track
-                 statsOutputLevel:RTCStatsOutputLevelStandard
-                completionHandler:^(NSArray<RTCLegacyStatsReport *> *stats) {
-                  callback(@[@(YES), [self statsToJSON:stats]]);
-                }];
-  } else {
-    callback(@[@(NO), @"Track not found"]);
+  [peerConnection statisticsWithCompletionHandler:^(RTCStatisticsReport *report) {
+    resolve([self statsToJSON:report]);
+  }];
+}
+
+RCT_EXPORT_METHOD(peerConnectionRestartIce:(nonnull NSNumber *)objectID)
+{
+  RTCPeerConnection *peerConnection = self.peerConnections[objectID];
+  if (!peerConnection) {
+    return;
   }
+
+  [peerConnection restartIce];
 }
 
 /**
- * Constructs a JSON <tt>NSString</tt> representation of a specific array of
- * <tt>RTCLegacyStatsReport</tt>s.
+ * Constructs a JSON <tt>NSString</tt> representation of a specific
+ * <tt>RTCStatisticsReport</tt>s.
  * <p>
- * On iOS it is faster to (1) construct a single JSON <tt>NSString</tt>
- * representation of an array of <tt>RTCLegacyStatsReport</tt>s and (2) have it
- * pass through the React Native bridge rather than the array of
- * <tt>RTCLegacyStatsReport</tt>s.
  *
- * @param reports the array of <tt>RTCLegacyStatsReport</tt>s to represent in
- * JSON format
- * @return an <tt>NSString</tt> which represents the specified <tt>stats</tt> in
+ * @param <tt>RTCStatisticsReport</tt>s
+ * @return an <tt>NSString</tt> which represents the specified <tt>report</tt> in
  * JSON format
  */
-- (NSString *)statsToJSON:(NSArray<RTCLegacyStatsReport *> *)reports
+- (NSString *)statsToJSON:(RTCStatisticsReport *)report
 {
-  // XXX The initial capacity matters, of course, because it determines how many
-  // times the NSMutableString will have grow. But walking through the reports
-  // to compute an initial capacity which exactly matches the requirements of
-  // the reports is too much work without real-world bang here. A better
-  // approach is what the Android counterpart does i.e. cache the
-  // NSMutableString and preferably with a Java-like soft reference. If that is
-  // too much work, then an improvement should be caching the required capacity
-  // from the previous invocation of the method and using it as the initial
-  // capacity in the next invocation. As I didn't want to go even through that,
-  // choosing just about any initial capacity is OK because NSMutableCopy
-  // doesn't have too bad a strategy of growing.
-  NSMutableString *s = [NSMutableString stringWithCapacity:8 * 1024];
+  /* 
+  The initial capacity matters, of course, because it determines how many
+  times the NSMutableString will have grow. But walking through the reports
+  to compute an initial capacity which exactly matches the requirements of
+  the reports is too much work without real-world bang here. An improvement
+  should be caching the required capacity from the previous invocation of the 
+  method and using it as the initial capacity in the next invocation. 
+  As I didn't want to go even through that,choosing just about any initial 
+  capacity is OK because NSMutableCopy doesn't have too bad a strategy of growing.
+  */
+  NSMutableString *s = [NSMutableString stringWithCapacity:16 * 1024];
 
   [s appendString:@"["];
   BOOL firstReport = YES;
-  for (RTCLegacyStatsReport *report in reports) {
+  for (NSString *key in report.statistics.allKeys) {
     if (firstReport) {
       firstReport = NO;
     } else {
       [s appendString:@","];
     }
-    [s appendString:@"{\"id\":\""]; [s appendString:report.reportId];
-    [s appendString:@"\",\"type\":\""]; [s appendString:report.type];
-    [s appendString:@"\",\"timestamp\":"];
-    [s appendFormat:@"%f", report.timestamp];
-    [s appendString:@",\"values\":["];
-    __block BOOL firstValue = YES;
-    [report.values enumerateKeysAndObjectsUsingBlock:^(
-        NSString *key,
-        NSString *value,
-        BOOL *stop) {
-      if (firstValue) {
-        firstValue = NO;
-      } else {
+  
+    [s appendString:@"[\""];
+    [s appendString: key];
+    [s appendString:@"\",{"];
+
+    RTCStatistics *statistics = report.statistics[key];
+    [s appendString:@"\"timestamp\":"];
+    [s appendFormat:@"%f", statistics.timestamp_us / 1000.0];
+    [s appendString:@",\"type\":\""]; 
+    [s appendString:statistics.type];
+    [s appendString:@"\",\"id\":\""];
+    [s appendString:statistics.id];
+    [s appendString:@"\""];
+
+    for (id key in statistics.values) {
         [s appendString:@","];
-      }
-      [s appendString:@"{\""]; [s appendString:key];
-      [s appendString:@"\":\""]; [s appendString:value];
-      [s appendString:@"\"}"];
-    }];
-    [s appendString:@"]}"];
-  }
+        [s appendString:@"\""];
+        [s appendString:key];
+        [s appendString:@"\":"];
+        NSObject *statisticsValue = [statistics.values objectForKey:key];
+        if ([statisticsValue isKindOfClass:[NSArray class]]) {
+            [s appendString:@"["];
+            BOOL firstValue = YES;
+            for (NSObject *value in (NSArray *)statisticsValue) {
+              if(firstValue) {
+                firstValue = NO;
+              } else {
+                [s appendString:@","];
+              }
+
+              [s appendString:@"\""];
+              [s appendString:[NSString stringWithFormat:@"%@", value]];
+              [s appendString:@"\""];
+            }
+            [s appendString:@"]"];
+        } else {
+            [s appendString:@"\""];
+            [s appendString:[NSString stringWithFormat:@"%@", statisticsValue]];
+            [s appendString:@"\""];
+        }
+    }
+    
+    [s appendString:@"}]"];
+  } 
+
   [s appendString:@"]"];
 
   return s;
+}
+
+- (NSString *)stringForPeerConnectionState:(RTCPeerConnectionState)state {
+  switch (state) {
+    case RTCPeerConnectionStateNew: return @"new";
+    case RTCPeerConnectionStateConnecting: return @"connecting";
+    case RTCPeerConnectionStateConnected: return @"connected";
+    case RTCPeerConnectionStateDisconnected: return @"disconnected";
+    case RTCPeerConnectionStateFailed: return @"failed";
+    case RTCPeerConnectionStateClosed: return @"closed";
+  }
+  return nil;
 }
 
 - (NSString *)stringForICEConnectionState:(RTCIceConnectionState)state {
@@ -597,8 +653,11 @@ RCT_EXPORT_METHOD(peerConnectionGetStats:(nonnull NSString *)trackID
 #pragma mark - RTCPeerConnectionDelegate methods
 
 - (void)peerConnection:(RTCPeerConnection *)peerConnection didChangeSignalingState:(RTCSignalingState)newState {
-  [self.bridge.eventDispatcher sendDeviceEventWithName:@"peerConnectionSignalingStateChanged" body:
-   @{@"id": peerConnection.reactTag, @"signalingState": [self stringForSignalingState:newState]}];
+  [self sendEventWithName:kEventPeerConnectionSignalingStateChanged
+                     body:@{
+                       @"id": peerConnection.reactTag,
+                       @"signalingState": [self stringForSignalingState:newState]
+                     }];
 }
 
 - (void)peerConnection:(RTCPeerConnection *)peerConnection didAddStream:(RTCMediaStream *)stream {
@@ -615,8 +674,20 @@ RCT_EXPORT_METHOD(peerConnectionGetStats:(nonnull NSString *)trackID
   }
 
   peerConnection.remoteStreams[streamReactTag] = stream;
-  [self.bridge.eventDispatcher sendDeviceEventWithName:@"peerConnectionAddedStream"
-                                                  body:@{@"id": peerConnection.reactTag, @"streamId": stream.streamId, @"streamReactTag": streamReactTag, @"tracks": tracks}];
+
+  id newSdp = @{
+    @"type": [RTCSessionDescription stringForType:peerConnection.remoteDescription.type],
+    @"sdp": peerConnection.remoteDescription.sdp
+  };
+
+  [self sendEventWithName:kEventPeerConnectionAddedStream
+                     body:@{
+                       @"id": peerConnection.reactTag,
+                       @"streamId": stream.streamId,
+                       @"streamReactTag": streamReactTag,
+                       @"tracks": tracks,
+                       @"sdp": newSdp
+                     }];
 }
 
 - (void)peerConnection:(RTCPeerConnection *)peerConnection didRemoveStream:(RTCMediaStream *)stream {
@@ -643,50 +714,94 @@ RCT_EXPORT_METHOD(peerConnectionGetStats:(nonnull NSString *)trackID
     [peerConnection.remoteTracks removeObjectForKey:track.trackId];
   }
   [peerConnection.remoteStreams removeObjectForKey:streamReactTag];
-  [self.bridge.eventDispatcher sendDeviceEventWithName:@"peerConnectionRemovedStream" body:
-   @{@"id": peerConnection.reactTag, @"streamId": streamReactTag}];
+
+  id newSdp = @{
+    @"type": [RTCSessionDescription stringForType:peerConnection.remoteDescription.type],
+    @"sdp": peerConnection.remoteDescription.sdp
+  };
+
+  [self sendEventWithName:kEventPeerConnectionRemovedStream
+                     body:@{
+                       @"id": peerConnection.reactTag,
+                       @"streamId": streamReactTag,
+                       @"sdp": newSdp
+                     }];
 }
 
 - (void)peerConnectionShouldNegotiate:(RTCPeerConnection *)peerConnection {
-  [self.bridge.eventDispatcher sendDeviceEventWithName:@"peerConnectionOnRenegotiationNeeded" body:
-   @{@"id": peerConnection.reactTag}];
+  [self sendEventWithName:kEventPeerConnectionOnRenegotiationNeeded
+                     body:@{ @"id": peerConnection.reactTag }];
+}
+
+- (void)peerConnection:(RTCPeerConnection *)peerConnection didChangeConnectionState:(RTCPeerConnectionState)newState {
+  [self sendEventWithName:kEventPeerConnectionStateChanged
+                     body:@{@"id": peerConnection.reactTag, @"connectionState": [self stringForPeerConnectionState:newState]}];
 }
 
 - (void)peerConnection:(RTCPeerConnection *)peerConnection didChangeIceConnectionState:(RTCIceConnectionState)newState {
-  [self.bridge.eventDispatcher sendDeviceEventWithName:@"peerConnectionIceConnectionChanged" body:
-   @{@"id": peerConnection.reactTag, @"iceConnectionState": [self stringForICEConnectionState:newState]}];
+  [self sendEventWithName:kEventPeerConnectionIceConnectionChanged
+                     body:@{
+                       @"id": peerConnection.reactTag,
+                       @"iceConnectionState": [self stringForICEConnectionState:newState]
+                     }];
 }
 
 - (void)peerConnection:(RTCPeerConnection *)peerConnection didChangeIceGatheringState:(RTCIceGatheringState)newState {
-  [self.bridge.eventDispatcher sendDeviceEventWithName:@"peerConnectionIceGatheringChanged" body:
-   @{@"id": peerConnection.reactTag, @"iceGatheringState": [self stringForICEGatheringState:newState]}];
+  id newSdp = @{};
+  if (newState == RTCIceGatheringStateComplete) {
+      newSdp = @{
+          @"type": [RTCSessionDescription stringForType:peerConnection.localDescription.type],
+          @"sdp": peerConnection.localDescription.sdp
+      };
+  }
+  [self sendEventWithName:kEventPeerConnectionIceGatheringChanged
+                     body:@{
+                       @"id": peerConnection.reactTag,
+                       @"iceGatheringState": [self stringForICEGatheringState:newState],
+                       @"sdp": newSdp
+                     }];
 }
 
 - (void)peerConnection:(RTCPeerConnection *)peerConnection didGenerateIceCandidate:(RTCIceCandidate *)candidate {
-  [self.bridge.eventDispatcher sendDeviceEventWithName:@"peerConnectionGotICECandidate" body:
-   @{@"id": peerConnection.reactTag, @"candidate": @{@"candidate": candidate.sdp, @"sdpMLineIndex": @(candidate.sdpMLineIndex), @"sdpMid": candidate.sdpMid}}];
+  [self sendEventWithName:kEventPeerConnectionGotICECandidate
+                     body:@{
+                       @"id": peerConnection.reactTag,
+                       @"candidate": @{
+                           @"candidate": candidate.sdp,
+                           @"sdpMLineIndex": @(candidate.sdpMLineIndex),
+                           @"sdpMid": candidate.sdpMid
+                       },
+                       @"sdp": @{
+                           @"type": [RTCSessionDescription stringForType:peerConnection.localDescription.type],
+                           @"sdp": peerConnection.localDescription.sdp
+                       }
+                     }];
 }
 
 - (void)peerConnection:(RTCPeerConnection*)peerConnection didOpenDataChannel:(RTCDataChannel*)dataChannel {
-  // XXX RTP data channels are not defined by the WebRTC standard, have been
-  // deprecated in Chromium, and Google have decided (in 2015) to no longer
-  // support them (in the face of multiple reported issues of breakages).
-  if (-1 == dataChannel.channelId) {
-    return;
-  }
+    NSString *reactTag = [[NSUUID UUID] UUIDString];
+    DataChannelWrapper *dcw = [[DataChannelWrapper alloc] initWithChannel:dataChannel reactTag:reactTag];
+    dcw.pcId = peerConnection.reactTag;
+    peerConnection.dataChannels[reactTag] = dcw;
+    dcw.delegate = self;
 
-  NSNumber *dataChannelId = [NSNumber numberWithInteger:dataChannel.channelId];
-  dataChannel.peerConnectionId = peerConnection.reactTag;
-  peerConnection.dataChannels[dataChannelId] = dataChannel;
-  // WebRTCModule implements the category RTCDataChannel i.e. the protocol
-  // RTCDataChannelDelegate.
-  dataChannel.delegate = self;
-
-  NSDictionary *body = @{@"id": peerConnection.reactTag,
-                        @"dataChannel": @{@"id": dataChannelId,
-                                          @"label": dataChannel.label}};
-  [self.bridge.eventDispatcher sendDeviceEventWithName:@"peerConnectionDidOpenDataChannel"
-                                                  body:body];
+    NSDictionary *dataChannelInfo = @{
+        @"peerConnectionId": peerConnection.reactTag,
+        @"reactTag": reactTag,
+        @"label": dataChannel.label,
+        @"id": @(dataChannel.channelId),
+        @"ordered": @(dataChannel.isOrdered),
+        @"maxPacketLifeTime": @(dataChannel.maxPacketLifeTime),
+        @"maxRetransmits": @(dataChannel.maxRetransmits),
+        @"protocol": dataChannel.protocol,
+        @"negotiated": @(dataChannel.isNegotiated),
+        @"readyState": [self stringForDataChannelState:dataChannel.readyState]
+      };
+    NSDictionary *body = @{
+        @"id": peerConnection.reactTag,
+        @"dataChannel": dataChannelInfo
+    };
+    [self sendEventWithName:kEventPeerConnectionDidOpenDataChannel body:body];
 }
 
 - (void)peerConnection:(nonnull RTCPeerConnection *)peerConnection didRemoveIceCandidates:(nonnull NSArray<RTCIceCandidate *> *)candidates {
